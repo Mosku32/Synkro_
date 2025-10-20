@@ -17,38 +17,51 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 class SecurityManager:
     @staticmethod
     def sanitize_input(text):
+        """Protección contra XSS - Escapa caracteres HTML"""
         if text is None:
             return ""
         return html.escape(str(text))
     
     @staticmethod
     def safe_path_access(file_path, base_directory):
+        """Protección contra Path Traversal"""
         base_path = Path(base_directory).resolve()
         requested_path = Path(file_path)
+        
+        # Combinar rutas de forma segura
         full_path = (base_path / requested_path).resolve()
+        
+        # Verificar que la ruta final esté dentro del directorio base
         if not str(full_path).startswith(str(base_path)):
             return None
         return full_path
     
     @staticmethod
     def validate_filename(filename):
+        """Valida que el nombre de archivo sea seguro"""
         if not filename or filename.strip() == "":
             return False
+        
+        # Patrón seguro para nombres de archivo
         pattern = r'^[a-zA-Z0-9_\-\. ]+$'
         return bool(re.match(pattern, filename))
     
     @staticmethod
     def validate_folder_name(folder_name):
+        """Valida nombres de carpeta"""
         if not folder_name or len(folder_name.strip()) < 1 or len(folder_name) > 100:
             return False
+        # Eliminar caracteres peligrosos
         cleaned = re.sub(r'[<>:"/\\|?*]', '', folder_name)
         return cleaned.strip()
 
 security = SecurityManager()
 
-# Decorador para proteger carpetas
+# =========== SEGURIDAD: Decorador para verificación de permisos =========== #
 def validate_folder_access(f):
+    """Decorador para proteger acceso a carpetas (IDOR protection)"""
     from functools import wraps
+    
     @wraps(f)
     def decorated_function(*args, **kwargs):
         folder_id = kwargs.get('folder_id')
@@ -56,8 +69,9 @@ def validate_folder_access(f):
             conn = get_db_connection()
             folder = conn.execute("SELECT * FROM folders WHERE id=?", (folder_id,)).fetchone()
             conn.close()
+            
             if not folder:
-                abort(404)
+                abort(404)  # No revelar información específica
         return f(*args, **kwargs)
     return decorated_function
 
@@ -152,22 +166,28 @@ def upload_pdf(folder_id):
     if "pdf_file" not in request.files:
         flash("No se seleccionó archivo", "danger")
         return redirect(url_for("open_folder", folder_id=folder_id))
+    
     file = request.files["pdf_file"]
     tags = request.form.get("tags", "")
     safe_tags = security.sanitize_input(tags)
+    
     if file.filename == "":
         flash("Archivo inválido", "danger")
         return redirect(url_for("open_folder", folder_id=folder_id))
+    
     if not security.validate_filename(file.filename):
         flash("Nombre de archivo no permitido", "danger")
         return redirect(url_for("open_folder", folder_id=folder_id))
+    
     filename = file.filename
     folder_path = os.path.join(UPLOAD_FOLDER, str(folder_id))
     os.makedirs(folder_path, exist_ok=True)
     file_path = os.path.join(folder_path, filename)
+    
     if not filename.lower().endswith('.pdf'):
         flash("Solo se permiten archivos PDF", "danger")
         return redirect(url_for("open_folder", folder_id=folder_id))
+    
     file.save(file_path)
     upload_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db_connection()
@@ -177,6 +197,81 @@ def upload_pdf(folder_id):
     conn.close()
     flash(f'PDF "{filename}" subido correctamente', "success")
     return redirect(url_for("open_folder", folder_id=folder_id))
+
+@app.route("/delete_pdf/<int:pdf_id>/<int:folder_id>", methods=["POST"])
+@validate_folder_access
+def delete_pdf(pdf_id, folder_id):
+    conn = get_db_connection()
+    pdf = conn.execute("SELECT * FROM pdfs WHERE id=?", (pdf_id,)).fetchone()
+    if pdf:
+        safe_path = security.safe_path_access(pdf["filename"], os.path.join(UPLOAD_FOLDER, str(folder_id)))
+        if safe_path and os.path.exists(safe_path):
+            os.remove(safe_path)
+        else:
+            flash("Ruta de archivo no válida", "danger")
+        conn.execute("DELETE FROM pdfs WHERE id=?", (pdf_id,))
+        conn.commit()
+        flash(f'PDF "{pdf["filename"]}" eliminado', "success")
+    conn.close()
+    return redirect(url_for("open_folder", folder_id=folder_id))
+
+@app.route("/edit_pdf/<int:pdf_id>/<int:folder_id>", methods=["POST"])
+@validate_folder_access
+def edit_pdf(pdf_id, folder_id):
+    new_name = request.form["new_name"]
+    if not security.validate_filename(new_name):
+        flash("Nombre de archivo no permitido", "danger")
+        return redirect(url_for("open_folder", folder_id=folder_id))
+    
+    conn = get_db_connection()
+    pdf = conn.execute("SELECT * FROM pdfs WHERE id=?", (pdf_id,)).fetchone()
+    if pdf:
+        old_safe_path = security.safe_path_access(pdf["filename"], os.path.join(UPLOAD_FOLDER, str(folder_id)))
+        new_safe_path = security.safe_path_access(new_name, os.path.join(UPLOAD_FOLDER, str(folder_id)))
+        if not old_safe_path or not new_safe_path:
+            flash("Ruta de archivo no válida", "danger")
+            conn.close()
+            return redirect(url_for("open_folder", folder_id=folder_id))
+        try:
+            os.rename(old_safe_path, new_safe_path)
+            conn.execute("UPDATE pdfs SET filename=? WHERE id=?", (new_name, pdf_id))
+            conn.commit()
+            flash(f'PDF renombrado a "{new_name}"', "success")
+        except FileNotFoundError:
+            flash("Archivo original no encontrado", "danger")
+        except PermissionError:
+            flash("No se puede renombrar archivo, revisa permisos", "danger")
+    conn.close()
+    return redirect(url_for("open_folder", folder_id=folder_id))
+
+@app.route("/update_pdf/<int:pdf_id>", methods=["POST"])
+def update_pdf(pdf_id):
+    new_name = request.form["filename"]
+    new_tags = request.form["tags"]
+    if not security.validate_filename(new_name):
+        return "Nombre de archivo no válido", 400
+    safe_tags = security.sanitize_input(new_tags)
+    conn = get_db_connection()
+    pdf = conn.execute("SELECT * FROM pdfs WHERE id=?", (pdf_id,)).fetchone()
+    if not pdf:
+        conn.close()
+        return "PDF no encontrado", 404
+    folder_id = pdf["folder_id"]
+    old_safe_path = security.safe_path_access(pdf["filename"], os.path.join(UPLOAD_FOLDER, str(folder_id)))
+    new_safe_path = security.safe_path_access(new_name, os.path.join(UPLOAD_FOLDER, str(folder_id)))
+    if not old_safe_path or not new_safe_path:
+        conn.close()
+        return "Ruta de archivo no válida", 400
+    if old_safe_path != new_safe_path:
+        try:
+            os.rename(old_safe_path, new_safe_path)
+        except Exception as e:
+            conn.close()
+            return f"Error al renombrar: {str(e)}", 500
+    conn.execute("UPDATE pdfs SET filename=?, tags=? WHERE id=?", (new_name, safe_tags, pdf_id))
+    conn.commit()
+    conn.close()
+    return "ok"
 
 @app.route("/view_pdf/<int:folder_id>/<filename>")
 @validate_folder_access
@@ -199,7 +294,7 @@ def search(folder_id):
     conn.close()
     return render_template("index.html", folders=folders, pdfs=pdfs, folder_selected=folder_selected)
 
-# Manejo de errores
+# =========== Manejo global de errores =========== #
 @app.errorhandler(404)
 def not_found(error):
     return render_template('404.html'), 404
